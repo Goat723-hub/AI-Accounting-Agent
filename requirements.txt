@@ -1,0 +1,15 @@
+# AI-Accounting-Agent 依赖
+#
+# 装法：pip install -r requirements.txt
+#
+# 版本号写成 >=（实测通过的下限），不是精确锁定。
+# 想要和我本地完全一致的环境，把下面四个 >= 换成 == 即可。
+#
+# 判断标准：只列**代码里直接 import 的**第三方库。
+# 传递依赖（langchain-core、langgraph-checkpoint 等）不列 ——
+# pip 装上面这几个时会自动带上，手动列反而容易版本打架。
+
+langgraph>=1.2.11          # Agent 主流程：StateGraph / 节点 / 条件边
+langchain-openai>=1.6.2    # 调 DeepSeek 的 OpenAI 兼容客户端
+python-dotenv>=1.2.1       # 从 .env 读 DEEPSEEK_API_KEY
+openpyxl>=3.1.5            # 读 xlsx 工资表
