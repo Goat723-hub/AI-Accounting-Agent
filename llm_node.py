@@ -68,6 +68,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
 from extraction import FIELD_MAP, UNMAPPED_KEY
+import logger
 from memory import save_candidate_rule
 
 
@@ -277,9 +278,31 @@ def analyze_unknown_fields(
         #
         # 记类型名不只记 message：DeepSeek 返回的 401 和网络超时
         # 都是「调用失败」，但处理方式完全不同（一个去查 key，一个等会儿重试）。
+        #
+        # 这也算「调用过一次」：不带用量地记一笔。否则「没调用」和
+        # 「调了但失败」在费用上都表现为 0，失败就看起来是免费的了。
+        logger.note_llm_call()
         return {"candidates": [], "problems": [f"LLM 调用失败：{type(e).__name__}: {e}"]}
 
+    logger.note_llm_call(**_usage_of(response))
     return _parse_candidates(raw, unknown_fields)
+
+
+def _usage_of(response) -> dict:
+    """从响应里取 token 用量，取不到就返回空 dict。
+
+    返回空 dict 而不是 {"input_tokens": 0}：note_llm_call 收到 None 记的是
+    「没拿到」，收到 0 记的是「拿到了，是 0」—— 这两种在这个项目里必须分开。
+
+    为什么用 getattr 而不是直接 response.usage_metadata：
+    换个 provider、或者 langchain 改了字段名，这里会 AttributeError ——
+    而少记一个数不该让整张工资表算不出来。取不到就当没拿到。
+    """
+    usage = getattr(response, "usage_metadata", None) or {}
+    return {
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+    }
 
 
 def _build_client():

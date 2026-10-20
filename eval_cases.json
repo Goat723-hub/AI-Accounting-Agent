@@ -1,0 +1,453 @@
+{
+  "version": 1,
+  "note": [
+    "评测集。27 条 = 9 类场景 × 3 条。",
+    "",
+    "为什么是 json 不是 27 个 xlsx：xlsx 是二进制，git diff 看不见、改起来要开 Excel、",
+    "review 不了。这里只描述「表长什么样、规则库预置什么、人做了什么决定、期望什么结果」，",
+    "benchmark.py 跑之前在临时目录现场生成 xlsx，跑完删掉。",
+    "",
+    "---- 关于 extra_as：评测集的 ground truth ----",
+    "",
+    "表里的「实发工资」是客户填的，代表这笔钱业务上真实应得。",
+    "认不出来的列（餐补、季度激励、宿舍费）在业务上到底算什么，系统不知道 ——",
+    "extra_as 就是评测集替它说清楚的地方。benchmark 按 extra_as 算出表里该写多少实发，",
+    "再拿系统算出来的去比。这一栏说的**只是业务事实**，跟规则库里那条规则批没批无关：",
+    "规则批了 -> 系统也算得出来 -> 对得上；规则没批 -> 系统漏算 -> 对不上，validation 该报。",
+    "两种结果都是有用的信号，都值得测。",
+    "",
+    "---- 关于行列搭配（踩过的坑）----",
+    "",
+    "extra_as 说某列是 bonus 时，这张表里就**不能**再有「奖金」列。",
+    "因为 apply_rules 一旦发现目标字段已经存在，就拒绝覆盖并记一条 problem ——",
+    "那是 conflict 场景专门要测的东西。混进来，memory_* 和 new_field 就不再是",
+    "「测规则有没有生效」，而是「测冲突有没有被拦」，两个场景的结论互相污染。",
+    "",
+    "同理，列名必须是 FIELD_MAP 里**没有**的（extraction.FIELD_MAP），",
+    "否则 parser 直接就认出来了，根本走不到内存和 LLM 那一步。",
+    "「罚款」看着生僻，其实是 deduction 的正规别名 —— 用过一次，踩过。",
+    "",
+    "---- 其他约定 ----",
+    "",
+    "rows 里实发工资那一列写 null = 「由 benchmark 按 extra_as 算」。",
+    "写 \"wrong\" = 故意跟算出来的对不上（测 validation）。",
+    "",
+    "expect 里 null = 不检查这一项。",
+    "",
+    "expect.unknown_fields 记的是**解析阶段认不出来的列**，规则生效之后它也不会被清空 ——",
+    "所以 memory_approved-01 里那条规则明明命中了，这一项仍然是 [\"餐补\"]。",
+    "它回答的是「这张表进来时有哪些列不认识」，不是「最后还剩哪些没解决」。",
+    "",
+    "expect.people_count / skipped_count：规则没生效时那个认不出的列就是缺的，",
+    "calculation 的必需输入凑不齐 -> 这个人被跳过 -> people 0 / skipped 1。",
+    "所以这两项本身就在验证「规则到底有没有真的用上」。"
+  ],
+  "cases": [
+    {
+      "id": "happy-01",
+      "scenario": "happy",
+      "note": "标准七列，两人，全部字段都认识",
+      "columns": ["工号", "姓名", "部门", "基本工资", "奖金", "扣款", "实发工资"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 3000, 0, null],
+        ["A002", "李娜", "财务部", 8000, 0, 200, null]
+      ],
+      "expect": {
+        "parse_error": false, "unknown_fields": [], "people_count": 2,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+    {
+      "id": "happy-02",
+      "scenario": "happy",
+      "note": "三人，含奖金为 0 和扣款大于奖金",
+      "columns": ["工号", "姓名", "部门", "基本工资", "奖金", "扣款", "实发工资"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 3000, 0, null],
+        ["A002", "李娜", "财务部", 8000, 0, 200, null],
+        ["A003", "王强", "市场部", 9500, 500, 1500, null]
+      ],
+      "expect": {
+        "parse_error": false, "unknown_fields": [], "people_count": 3,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+    {
+      "id": "happy-03",
+      "scenario": "happy",
+      "note": "一人高薪 45000，落在个税第五档，测累进税率没写错",
+      "columns": ["工号", "姓名", "部门", "基本工资", "奖金", "扣款", "实发工资"],
+      "rows": [
+        ["A001", "赵敏", "总经办", 45000, 15000, 0, null]
+      ],
+      "expect": {
+        "parse_error": false, "unknown_fields": [], "people_count": 1,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+
+    {
+      "id": "alias-01",
+      "scenario": "alias",
+      "note": "全套别名：员工编号/员工姓名/所属部门/固定薪资/绩效奖金/扣除/到手工资",
+      "columns": ["员工编号", "员工姓名", "所属部门", "固定薪资", "绩效奖金", "扣除", "到手工资"],
+      "rows": [
+        ["B001", "孙悦", "产品部", 11000, 2000, 100, null],
+        ["B002", "周杰", "技术部", 15000, 0, 0, null]
+      ],
+      "expect": {
+        "parse_error": false, "unknown_fields": [], "people_count": 2,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+    {
+      "id": "alias-02",
+      "scenario": "alias",
+      "note": "最短别名：编号/名字/所在部门/底薪/绩效/罚款/实发",
+      "columns": ["编号", "名字", "所在部门", "底薪", "绩效", "罚款", "实发"],
+      "rows": [
+        ["C001", "吴迪", "行政部", 7000, 800, 50, null]
+      ],
+      "expect": {
+        "parse_error": false, "unknown_fields": [], "people_count": 1,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+    {
+      "id": "alias-03",
+      "scenario": "alias",
+      "note": "混搭：工号 + 员工姓名 + 部门 + 固定工资 + 津贴 + 扣款 + 到手工资",
+      "columns": ["工号", "员工姓名", "部门", "固定工资", "津贴", "扣款", "到手工资"],
+      "rows": [
+        ["D001", "郑爽", "人事部", 9000, 1200, 0, null],
+        ["D002", "钱枫", "法务部", 13000, 0, 300, null]
+      ],
+      "expect": {
+        "parse_error": false, "unknown_fields": [], "people_count": 2,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+
+    {
+      "id": "dirty-01",
+      "scenario": "dirty",
+      "note": "金额带噪音：¥12,000 / 3,000元 / 全角逗号 / 全角零",
+      "columns": ["工号", "姓名", "部门", "基本工资", "奖金", "扣款", "实发工资"],
+      "rows": [
+        ["A001", "张伟", "研发部", "¥12,000", "3,000元", "０", null],
+        ["A002", "李娜", "财务部", "8，000", 0, 200, null]
+      ],
+      "expect": {
+        "parse_error": false, "unknown_fields": [], "people_count": 2,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+    {
+      "id": "dirty-02",
+      "scenario": "dirty",
+      "note": "空值：奖金 None、扣款空串 —— 都该当 0，不该把整张表带崩",
+      "columns": ["工号", "姓名", "部门", "基本工资", "奖金", "扣款", "实发工资"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, null, "", null],
+        ["A002", "李娜", "财务部", 8000, "", null, null]
+      ],
+      "expect": {
+        "parse_error": false, "unknown_fields": [], "people_count": 2,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+    {
+      "id": "dirty-03",
+      "scenario": "dirty",
+      "note": "表里的实发工资跟算出来的对不上 —— validation 该抓到",
+      "columns": ["工号", "姓名", "部门", "基本工资", "奖金", "扣款", "实发工资"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 3000, 0, "wrong"]
+      ],
+      "expect": {
+        "parse_error": false, "unknown_fields": [], "people_count": 1,
+        "skipped_count": 0, "halt": false, "validation_passed": false
+      }
+    },
+
+    {
+      "id": "new_field-01",
+      "scenario": "new_field",
+      "note": "全新列「季度激励」，memory 里没有 -> 走 LLM -> 人批准 -> 直接用上",
+      "columns": ["工号", "姓名", "部门", "基本工资", "扣款", "实发工资", "季度激励"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 0, null, 5000]
+      ],
+      "extra_as": {"季度激励": "bonus"},
+      "memory": {},
+      "decisions": [{"field": "季度激励", "decision": "approve"}],
+      "expect": {
+        "parse_error": false, "unknown_fields": ["季度激励"], "people_count": 1,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+    {
+      "id": "new_field-02",
+      "scenario": "new_field",
+      "note": "同上，两人，季度激励各不相同 —— 认不出的钱有没有按人分别加进去",
+      "columns": ["工号", "姓名", "部门", "基本工资", "扣款", "实发工资", "季度激励"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 0, null, 5000],
+        ["A002", "李娜", "财务部", 8000, 200, null, 2500]
+      ],
+      "extra_as": {"季度激励": "bonus"},
+      "memory": {},
+      "decisions": [{"field": "季度激励", "decision": "approve"}],
+      "expect": {
+        "parse_error": false, "unknown_fields": ["季度激励"], "people_count": 2,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+    {
+      "id": "new_field-03",
+      "scenario": "new_field",
+      "note": "全新列 + 人不表态 -> 规则保持 pending 没被用上 -> bonus 缺失，这人算不出来",
+      "columns": ["工号", "姓名", "部门", "基本工资", "扣款", "实发工资", "季度激励"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 0, null, 5000]
+      ],
+      "extra_as": {"季度激励": "bonus"},
+      "memory": {},
+      "decisions": [],
+      "expect": {
+        "parse_error": false, "unknown_fields": ["季度激励"], "people_count": 0,
+        "skipped_count": 1, "halt": false, "validation_passed": false
+      }
+    },
+
+    {
+      "id": "memory_approved-01",
+      "scenario": "memory_approved",
+      "note": "「餐补」已在规则库里批准 -> 直接命中，不用问 LLM 也不用问人",
+      "columns": ["工号", "姓名", "部门", "基本工资", "扣款", "实发工资", "餐补"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 0, null, 600]
+      ],
+      "extra_as": {"餐补": "bonus"},
+      "memory": {"餐补": {"mapping": "bonus", "status": "approved", "confidence": 0.95}},
+      "expect": {
+        "parse_error": false, "unknown_fields": ["餐补"], "people_count": 1,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+    {
+      "id": "memory_approved-02",
+      "scenario": "memory_approved",
+      "note": "同上，两人，每人餐补不同",
+      "columns": ["工号", "姓名", "部门", "基本工资", "扣款", "实发工资", "餐补"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 0, null, 600],
+        ["A002", "李娜", "财务部", 8000, 200, null, 600]
+      ],
+      "extra_as": {"餐补": "bonus"},
+      "memory": {"餐补": {"mapping": "bonus", "status": "approved", "confidence": 0.95}},
+      "expect": {
+        "parse_error": false, "unknown_fields": ["餐补"], "people_count": 2,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+    {
+      "id": "memory_approved-03",
+      "scenario": "memory_approved",
+      "note": "规则映射到扣款侧：「交通补贴」-> deduction（表里就没有「扣款」列了）",
+      "columns": ["工号", "姓名", "部门", "基本工资", "奖金", "实发工资", "交通补贴"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 2000, null, 300]
+      ],
+      "extra_as": {"交通补贴": "deduction"},
+      "memory": {"交通补贴": {"mapping": "deduction", "status": "approved", "confidence": 0.9}},
+      "expect": {
+        "parse_error": false, "unknown_fields": ["交通补贴"], "people_count": 1,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+
+    {
+      "id": "memory_pending-01",
+      "scenario": "memory_pending",
+      "note": "规则库里挂着 pending -> 该走到人工复核 -> 人批准 -> 用上",
+      "columns": ["工号", "姓名", "部门", "基本工资", "扣款", "实发工资", "餐补"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 0, null, 600]
+      ],
+      "extra_as": {"餐补": "bonus"},
+      "memory": {"餐补": {"mapping": "bonus", "status": "pending", "confidence": 0.9}},
+      "decisions": [{"field": "餐补", "decision": "approve"}],
+      "expect": {
+        "parse_error": false, "unknown_fields": ["餐补"], "people_count": 1,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+    {
+      "id": "memory_pending-02",
+      "scenario": "memory_pending",
+      "note": "pending + 人否决 -> 该停下（halt），不该安静地少算",
+      "columns": ["工号", "姓名", "部门", "基本工资", "扣款", "实发工资", "餐补"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 0, null, 600]
+      ],
+      "extra_as": {"餐补": "bonus"},
+      "memory": {"餐补": {"mapping": "bonus", "status": "pending", "confidence": 0.9}},
+      "decisions": [{"field": "餐补", "decision": "reject", "reason": "餐补不该算进奖金"}],
+      "expect": {
+        "parse_error": false, "unknown_fields": ["餐补"], "people_count": 0,
+        "skipped_count": 0, "halt": true, "validation_passed": null
+      }
+    },
+    {
+      "id": "memory_pending-03",
+      "scenario": "memory_pending",
+      "note": "pending + 人不表态 -> 保持 pending，流程照走，但钱算漏了",
+      "columns": ["工号", "姓名", "部门", "基本工资", "扣款", "实发工资", "餐补"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 0, null, 600]
+      ],
+      "extra_as": {"餐补": "bonus"},
+      "memory": {"餐补": {"mapping": "bonus", "status": "pending", "confidence": 0.9}},
+      "decisions": [],
+      "expect": {
+        "parse_error": false, "unknown_fields": ["餐补"], "people_count": 0,
+        "skipped_count": 1, "halt": false, "validation_passed": false
+      }
+    },
+
+    {
+      "id": "memory_rejected-01",
+      "scenario": "memory_rejected",
+      "note": "已被人工否过的字段 + 这次维持否决 -> 停下",
+      "columns": ["工号", "姓名", "部门", "基本工资", "扣款", "实发工资", "神秘补贴"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 0, null, 800]
+      ],
+      "extra_as": {"神秘补贴": "bonus"},
+      "memory": {"神秘补贴": {"mapping": "bonus", "status": "rejected", "confidence": 0.6}},
+      "decisions": [{"field": "神秘补贴", "decision": "reject", "reason": "来源不明"}],
+      "expect": {
+        "parse_error": false, "unknown_fields": ["神秘补贴"], "people_count": 0,
+        "skipped_count": 0, "halt": true, "validation_passed": null
+      }
+    },
+    {
+      "id": "memory_rejected-02",
+      "scenario": "memory_rejected",
+      "note": "被否过的字段 + 这次人翻回来批准 -> 用上，算得出来",
+      "columns": ["工号", "姓名", "部门", "基本工资", "扣款", "实发工资", "神秘补贴"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 0, null, 800]
+      ],
+      "extra_as": {"神秘补贴": "bonus"},
+      "memory": {"神秘补贴": {"mapping": "bonus", "status": "rejected", "confidence": 0.6}},
+      "decisions": [{"field": "神秘补贴", "decision": "approve"}],
+      "expect": {
+        "parse_error": false, "unknown_fields": ["神秘补贴"], "people_count": 1,
+        "skipped_count": 0, "halt": false, "validation_passed": true
+      }
+    },
+    {
+      "id": "memory_rejected-03",
+      "scenario": "memory_rejected",
+      "note": "被否过的字段 + 人这次一个字没说 -> 当前实现不停（已知边界），但钱算漏了",
+      "columns": ["工号", "姓名", "部门", "基本工资", "扣款", "实发工资", "神秘补贴"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 0, null, 800]
+      ],
+      "extra_as": {"神秘补贴": "bonus"},
+      "memory": {"神秘补贴": {"mapping": "bonus", "status": "rejected", "confidence": 0.6}},
+      "decisions": [],
+      "expect": {
+        "parse_error": false, "unknown_fields": ["神秘补贴"], "people_count": 0,
+        "skipped_count": 1, "halt": false, "validation_passed": false
+      }
+    },
+
+    {
+      "id": "conflict-01",
+      "scenario": "conflict",
+      "note": "表里本来就有「奖金」，规则又想把「餐补」映射去 bonus -> 该拒绝覆盖并记一笔",
+      "columns": ["工号", "姓名", "部门", "基本工资", "奖金", "扣款", "实发工资", "餐补"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 1000, 0, null, 600]
+      ],
+      "extra_as": {"餐补": "bonus"},
+      "memory": {"餐补": {"mapping": "bonus", "status": "approved", "confidence": 0.95}},
+      "expect": {
+        "parse_error": false, "unknown_fields": ["餐补"], "people_count": 1,
+        "skipped_count": 0, "halt": false, "validation_passed": false,
+        "has_problem": true
+      }
+    },
+    {
+      "id": "conflict-02",
+      "scenario": "conflict",
+      "note": "同上，撞在扣款侧：「扣款」已存在，「宿舍费」也想映射去 deduction",
+      "columns": ["工号", "姓名", "部门", "基本工资", "奖金", "扣款", "实发工资", "宿舍费"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 1000, 100, null, 50]
+      ],
+      "extra_as": {"宿舍费": "deduction"},
+      "memory": {"宿舍费": {"mapping": "deduction", "status": "approved", "confidence": 0.9}},
+      "expect": {
+        "parse_error": false, "unknown_fields": ["宿舍费"], "people_count": 1,
+        "skipped_count": 0, "halt": false, "validation_passed": false,
+        "has_problem": true
+      }
+    },
+    {
+      "id": "conflict-03",
+      "scenario": "conflict",
+      "note": "两人都有冲突，冲突是逐行报的，不该只报第一行",
+      "columns": ["工号", "姓名", "部门", "基本工资", "奖金", "扣款", "实发工资", "餐补"],
+      "rows": [
+        ["A001", "张伟", "研发部", 12000, 1000, 0, null, 600],
+        ["A002", "李娜", "财务部", 8000, 500, 0, null, 600]
+      ],
+      "extra_as": {"餐补": "bonus"},
+      "memory": {"餐补": {"mapping": "bonus", "status": "approved", "confidence": 0.95}},
+      "expect": {
+        "parse_error": false, "unknown_fields": ["餐补"], "people_count": 2,
+        "skipped_count": 0, "halt": false, "validation_passed": false,
+        "has_problem": true
+      }
+    },
+
+    {
+      "id": "broken-01",
+      "scenario": "broken_input",
+      "note": "文件根本不存在",
+      "file_kind": "missing",
+      "columns": [], "rows": [],
+      "expect": {
+        "parse_error": true, "unknown_fields": [], "people_count": 0,
+        "skipped_count": 0, "halt": true, "validation_passed": null
+      }
+    },
+    {
+      "id": "broken-02",
+      "scenario": "broken_input",
+      "note": "xlsx 能打开，但里面一行数据都没有",
+      "file_kind": "empty",
+      "columns": [], "rows": [],
+      "expect": {
+        "parse_error": true, "unknown_fields": [], "people_count": 0,
+        "skipped_count": 0, "halt": true, "validation_passed": null
+      }
+    },
+    {
+      "id": "broken-03",
+      "scenario": "broken_input",
+      "note": "表头认不出来（只有一行标题，没有任何眼熟的列名）-> 宁可报错也不猜",
+      "file_kind": "no_header",
+      "columns": ["甲", "乙", "丙"],
+      "rows": [["一", "二", "三"]],
+      "expect": {
+        "parse_error": true, "unknown_fields": [], "people_count": 0,
+        "skipped_count": 0, "halt": true, "validation_passed": null
+      }
+    }
+  ]
+}

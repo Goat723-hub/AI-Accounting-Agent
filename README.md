@@ -86,6 +86,9 @@ pip install -r requirements.txt
 
 cp .env.example .env          # 然后把 DEEPSEEK_API_KEY 换成你自己的
 python payroll_agent.py       # 跑 5 个场景的完整演示
+
+python -m unittest test_logger test_agent_logging test_evaluation   # 101 条测试
+python benchmark.py           # 27 条评测用例（不需要 key，LLM 用固定桩）
 ```
 
 `.env` 里填 DeepSeek 的 key（[申请地址](https://platform.deepseek.com)）。**不填也能跑** —— 流程不会崩，只是遇到没见过的列名时提不出候选，直接转人工。
@@ -156,20 +159,89 @@ python payroll_agent.py       # 跑 5 个场景的完整演示
 
 ---
 
+## 可观测性：三个文件，三种读者
+
+| 文件 | 一次运行 | 读者 | 回答什么 |
+|---|---|---|---|
+| `logs/agent.log` | 十几行 | 人（`grep`） | 谁在什么时候做了什么、成了没有 |
+| `logs/trace.jsonl` | 每节点一行 | 机器 | 那个节点**进来时手上是什么形状** |
+| `runs/summary.jsonl` | **1 行** | 人和 `evaluation.py` | 这一趟整体成没成、栽在哪、该找谁 |
+
+分开是因为**读者不同**，不是为了好看：JSON 混进 `agent.log`，每行都要跟引号打架；事件流塞进 `jsonl`，就丢了一行扫过去的可读性。
+
+### 为什么轨迹只记形状
+
+工资表项目里，日志最容易出事的方式是有人图省事把整个 State 或一整行数据丢进去。所以 `trace.jsonl` 收的是整个 State，落盘的却是：
+
+```json
+{"node": "calculate", "input": {"extracted_rows": "list(4)", "memory_context": {"approved_rules": "list(0)"}},
+ "changed": ["calculation_result", "next_action"], "next_action": "validate"}
+```
+
+`"list(4)"`、`"str(22)"` —— 键名和大小都在，**值一个字都不在**。这不是靠调用方自觉：压形状的动作发生在 `logger` 里，调用方只有「把 State 交过来」这一个选项。
+
+失败那一行最值钱，所以也记，而且两格是 `null`：
+
+```json
+{"node": "calculate", "status": "failed", "changed": null, "next_action": null,
+ "error_type": "KeyError", "error_at": "calculation.py:88 calculate_payroll"}
+```
+
+`changed: null` 是「节点**没跑完**」，`[]` 是「跑完了但一个键都没改」—— 这两种在排查时完全不是一回事。`error_type` 只记类型名、`error_at` 只记代码坐标（文件、行号、函数名），**异常消息和 traceback 原文一个字都不记**：traceback 带着每一帧的源码行，而带源码行就可能带着当时的变量值（`KeyError: '张伟'`）。
+
+### 上限
+
+`agent.log` 和 `trace.jsonl` 超过 5 MB 就滚一代（`agent.log.1`），只留一代，磁盘占用恒定。切换发生在**两次运行之间** —— 按写入量切会把一次运行劈成两个文件，而这两个文件存在的全部意义就是「按 `task_id` 结合着看」。
+
+---
+
+## 评测：27 条用例，5 类检查
+
+```bash
+python benchmark.py                       # 跑一遍评测集
+python benchmark.py -v                    # 逐条打印
+python benchmark.py --keep-records DIR    # 留下一份运行记录给 evaluation 分析
+python evaluation.py                      # 分析最近 30 次运行
+```
+
+用例是 `eval_cases.json` 里 **9 个场景 × 3 条 = 27 条**：正常表、列名别名、脏数据、没见过的列、规则已批准 / 待批准 / 已否决、字段冲突、坏输入。每条检查 5 件事：字段识别、流程路由、计算结果、结果校验、规则冲突。
+
+**期望值不是被测代码算出来的。** `benchmark.py` 里另写了一套社保和个税的公式（`expected_net_pay`），**不 import `calculation.py`** —— 否则就成了「用被测代码验证被测代码」，它错了评测也会跟着错，而且永远是绿的。
+
+这套用例**不是空的**，这一点验证过：给 `calculate_payroll` 的每人金额偷偷加 0.01，27 条里有 15 条立刻变红；剩下 12 条是结构上看不见它的（已经在 `exception` 停住的、坏输入的、本来就期望校验失败的）。这次变异测试还顺带暴露了一个真实的覆盖缺口：**表里没有「实发工资」列时，`validate_source_match` 会被跳过，算错就发现不了**。
+
+`evaluation.py` 是另一个方向：它没有标准答案，只读 `runs/summary.jsonl` 找规律 —— 失败集中在哪一类、LLM 用量是不是正常、某个字段是不是老被否决。它守三条线：**只读**（不改 State、不碰 `memory.json`）、**不自动执行建议**（`suggested_action` 是给人看的一句话，不是命令）、**不猜**（样本不够就说样本不够，老数据缺字段算「不知道」，不算 0）。
+
+---
+
 ## 项目结构
 
 ```
 AI-Accounting-Agent/
-├── payroll_agent.py     Agent 主流程：State / Router / Graph / 日志 / demo
+├── payroll_agent.py     Agent 主流程：State / Router / Graph / demo
 ├── llm_node.py          唯一调用 LLM 的节点（提议权）
 ├── parser.py            文件处理：xlsx → 结构化数据（零 LLM）
 ├── extraction.py        信息提取：列名 → 标准字段（白名单）
 ├── calculation.py       计算：社保 / 个税 / 实发（纯 Python）
 ├── validation.py        校验：算出来的 vs 表里写的
 ├── memory.py            规则库：approved / pending / rejected 三态
+│
+├── logger.py            可观测性：事件流 + 节点轨迹，两个出口
+├── run_summary.py       运行记录：一次运行一行（失败分类 / 人工复核结论）
+│
+├── benchmark.py         评测集跑分：27 条用例 × 5 类检查
+├── eval_cases.json      评测用例本身（输入 + 期望值，人工写的）
+├── evaluation.py        失败分析：读运行记录，产出发现和建议
+│
+├── test_logger.py       35 条：日志格式 / 安全闸门 / 轮转
+├── test_agent_logging.py 27 条：真的把图跑起来的集成测试
+├── test_evaluation.py   39 条：分析器本身（含「不猜」的边界）
+│
 ├── requirements.txt
 ├── .env.example         配置模板（可提交）
 ├── .gitignore           .env* 被排除在外
+├── logs/                运行期产物（gitignore）
+├── runs/                运行记录 + 评测报告（gitignore）
 └── data/
     └── payroll_demo.xlsx
 ```
@@ -184,6 +256,8 @@ AI-Accounting-Agent/
 - **LangChain OpenAI** —— 用 OpenAI 兼容协议调 DeepSeek
 - **openpyxl** —— 读 xlsx
 - **python-dotenv** —— 从 `.env` 读 key
+- **unittest** —— 测试用标准库，刻意不引 pytest：`pip install` 之后就能跑
+- **jsonl** —— 运行记录和节点轨迹的格式，只追加，进程被掐也只少最后一行
 
 ---
 
@@ -193,13 +267,20 @@ AI-Accounting-Agent/
 - `.gitignore` 排除 `.env*`（含 `.env.local` 等变体），但保留 `.env.example` 模板
 - 换 key **不需要改任何代码**，只改 `.env` 一行
 
+**日志不落业务数据。** 姓名、身份证号、银行卡号、工资金额一个字都不进 `logs/` 和 `runs/`，这一条是**靠结构挡的**，不是靠注释提醒：
+
+- 传进来一个 dict，记下的是 `<dict>`，不是它的内容（`_safe_text` 只认字符串）
+- 要记结构只能走两个入口 —— `describe()`（一行文本）和 `shape_of()`（JSON 形状），两个都只报「有哪些键、每项多大」
+- 异常只记**类型名**和**代码坐标**，不记消息、不记 traceback（截断不是脱敏：`"张三 的工资 12000"` 截到 300 字还是张三还是 12000）
+- `runs/summary.jsonl` 里的人工复核结论只装**字段名**，不装金额和人员
+
 ---
 
 ## 已知限制
 
 诚实说明，这些是**有意没做**的：
 
-- **人不表态的字段不会中断流程**（[payroll_agent.py:1005](payroll_agent.py#L1005)）。目前只有**明确否决**才 halt。生产环境里「不表态」也应该阻止出结果 —— 这是个业务权衡，不是遗漏
+- **人不表态的字段不会中断流程**（[payroll_agent.py:870](payroll_agent.py#L870)）。目前只有**明确否决**才 halt。生产环境里「不表态」也应该阻止出结果 —— 这是个业务权衡，不是遗漏
 - **没接真实财务软件**。凭证生成是 RPA 接口桩
 - **只支持 xlsx**。PDF / 扫描件需要另加一层 LLM 提取
 - **单表处理**，没有批量 / 并发

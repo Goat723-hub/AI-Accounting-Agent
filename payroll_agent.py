@@ -20,6 +20,10 @@ Agent 不做的事：
     LLM（语义分析）—— 见 llm_node.py。
     只有一个节点用它，只干一件事：给没见过的列名提候选映射。
 
+    run-summary（运行记录）—— 见 run_summary.py。
+    一次运行一行：task_id、起止时间、成没成、栽在哪个节点。
+    只记运行元数据，不记 State、不记工资数据。
+
 刻意还没做的：
 
     LLM 决策路由、RAG、Tool Calling。
@@ -46,6 +50,7 @@ Agent 不做的事：
     所以下面看不到名叫 router 的节点，只有 route_after_xxx()。
 """
 
+import datetime
 import sys
 from operator import add
 from typing import Annotated, TypedDict
@@ -55,6 +60,8 @@ from langgraph.graph import END, START, StateGraph
 from calculation import calculate_payroll
 from extraction import extract_rows
 from llm_node import llm_rule_analysis_node
+import logger
+import run_summary
 from memory import (
     APPROVED,
     PENDING,
@@ -454,6 +461,26 @@ def human_review_node(state: PayrollState) -> dict:
             "decision": _review_summary(approved_now, rejected_now, undecided, candidates),
             "reviewer": reviewer,
             "decisions": decisions,
+            # ---- V2：同一件事的结构化版本 ----
+            #
+            # 上面那句 decision 是**给人看**的：
+            #     「批准 餐补 -> bonus；否决 神秘补贴」
+            # 人扫一眼就懂。但程序要拿它办事，只能上正则去抠字段名 ——
+            # 抠错了不报错，只是少算一个人。
+            #
+            # 这三个列表就是同一件事的机器可读版。Evaluation 要的是它们：
+            # 「哪个字段被反复否决」「哪个字段一直挂着没人管」，
+            # 都得先能拿到字段名才谈得上统计。
+            #
+            # 两边同时存在不是重复冗余 —— 是**同一份事实的两种读者**。
+            # 只留 decision 的话，Evaluation 得去解析中文；
+            # 只留这三个列表的话，demo 里人看到的是三个括号。
+            #
+            # 列表里装的是**字段名**（客户表里的列名），
+            # 不含金额、不含人员信息 —— 和 logger 那三道闸门的口径一致。
+            "approved": [candidate["field"] for candidate in approved_now],
+            "rejected": list(rejected_now),
+            "undecided": list(undecided),
         },
         "problems": problems,
         # 有人否决 -> 记下为什么停，后面的 Router 据此拐去 exception。
@@ -1006,7 +1033,7 @@ def route_after_human_review(state: PayrollState) -> str:
 
 
 def traced(name: str, node, sink: list | None):
-    """把一个节点包一层，记录它的进出。sink 是 None 就什么都不记。
+    """把一个节点包一层，记录它的进出。sink 是 None 就只记文件、不留在内存。
 
     为什么写成包装器，而不是在每个节点函数里插一句记录：
 
@@ -1026,62 +1053,92 @@ def traced(name: str, node, sink: list | None):
         为了让「有日志」和「没日志」走的是**同一条代码路径**。
         如果日志只在不传 sink 时装上，那上线跑的图和你本地调试的图
         就是两个不同的图，调通了不代表线上没问题。
+
+    ---- V2：这里顺带记 Node 级日志 ----
+
+    为什么日志也挂在这一层，而不是在每个节点函数里插一句：
+
+        节点根本不需要知道有 Logger 这个东西。它的签名还是
+        「State 进，局部更新出」，单独 import 出来测一个节点时
+        不会打印一堆东西、也不需要 task_id。
+
+        九个节点全部经过 traced（build_graph 里每一个 add_node 都用它包了），
+        所以「有没有漏掉某个节点」这件事，在 build_graph 那十几行里
+        一眼就能核对完 —— 不用去数每个节点里有没有写日志。
+
+    ---- 为什么落盘和 sink 不是同一个开关 ----
+
+    节点轨迹会**无条件**写进 logs/trace.jsonl，和传不传 sink 无关。
+
+        sink     是给**调用方**的内存副本（demo 打完就没了）。
+                 不传就是「我不要这份副本」，不代表「别记」。
+        文件     是**框架自己的**记录。它要能回答「上周三那次为什么
+                 卡在 calculate」，而那次没人记得要先传个列表。
+
+    两件事共用一个开关的话，默认值只能选一个：
+    默认不记，线上就没有轨迹；默认记，就得写 def run(..., trace=[])——
+    而**可变默认参数在 Python 里是同一个列表被所有调用共享的**，
+    第二次运行会拿到第一次的记录，而且看不出来。
+
+    所以这里不靠改默认值，靠把两件事分开。
+
+    task_id 不用传：logger 从当前执行流上取（run() 里用 task_scope 绑的）。
+    绕过 run() 直接 build_graph().invoke() 时取不到，task 那一格会是占位符 ——
+    这是已知边界，不是漏记。
     """
     def wrapped(state: PayrollState) -> dict:
-        update = node(state)
+        logger.node_started(name)
 
+        try:
+            update = node(state)
+
+        except Exception as exc:
+            # 记一笔，然后**原样抛出去**。
+            #
+            # 这里绝不能改成 return 一个「失败版的局部更新」：
+            # 节点抛异常说明它没跑完，State 缺的那几个键是**没有**，
+            # 不是「有但是错」。伪造一份回来，下游会拿着半个 State 一路
+            # 算到底，最后给出一份看着正常的工资表 —— 而那是错的。
+            logger.node_failed(name, message="节点抛出异常", error=exc)
+
+            # 轨迹也要追一行，而且这一行是整份文件里最值钱的：
+            # 「它进来时手上有什么」正是排查这次失败要看的东西，
+            # 而它**以后再也补不出来**了 —— 流程已经断了，
+            # 这个 State 不会再有任何地方被打印出来。
+            #
+            # changed / next_action 都是 None：节点没跑完，没有局部更新。
+            # 这和「跑完了但一个键都没改」是两回事，不能都写成空。
+            logger.node_trace(name, state, status=logger.FAILED, error=exc)
+            raise
+
+        # 记「交给谁」而不是「改了几个键」：读日志的人想知道的是流程
+        # 走了哪条路，不是 State 的形状。形状那件事 trace 记得更细
+        # （它连进来时的快照都有），两边各司其职，不重复。
+        logger.node_completed(name, message=f"交给 {update.get('next_action')}")
+
+        # state 是在节点**跑完之后**才压成形状的，记的却是「它进来时」——
+        # 这两件事现在等价，因为九个节点都是只读的：它们从 state 里读，
+        # 把改动放进返回值，从不原地改 state 里的东西。
+        #
+        # 这是一条**依赖**，不是巧合：哪天有节点写成 state["problems"].append(...)
+        # 这一行就开始撒谎了（记到的会包含它自己刚做的改动），而且不会红。
+        # 所以真要在节点里原地改 state，先把这一行改成进节点前压一次形状。
+        entry = logger.node_trace(
+            name,
+            state,
+            changed=sorted(update.keys()),
+            next_action=update.get("next_action"),
+        )
+
+        # 内存副本直接就是刚写下去的那一行 —— 不再另拼一份。
+        # 另拼一份的话，「这个节点长什么样」就有两个实现，
+        # 迟早会漂开，而漂开的方式最难查：内存里看到的和文件里写的不一样。
         if sink is not None:
-            sink.append(
-                {
-                    "node": name,
-                    "input": _snapshot(state),
-                    "changed": sorted(update.keys()),
-                    "next_action": update.get("next_action"),
-                }
-            )
+            sink.append(entry)
 
         return update
 
     return wrapped
-
-
-def _snapshot(state: dict) -> dict:
-    """State 的快照：只报有内容的键，值只报「有多大」。
-
-    为什么要滤掉空的：
-        默认值是 None / [] / "" 的键到处都是，全报出来是一面墙，
-        真正有信息的那几个被淹掉。空的不报，报的都是这次跑真的产生了什么的。
-
-    为什么不展开内容：
-        extracted_rows 可能有几千行。日志打全了就没法看，
-        要看内容去看最终 State —— 日志回答的是「形状对不对」，
-        不是「值对不对」。
-    """
-    return {key: _size_of(value) for key, value in state.items() if _has_content(value)}
-
-
-def _has_content(value) -> bool:
-    """这个值值不值得报。空列表、空字典、空串、None 都不值得。"""
-    return value is not None and value != "" and value != [] and value != {}
-
-
-def _size_of(value):
-    """把值压成「有多大」。
-
-    字典往下钻一层：memory_context 报成 {'approved_rules': 1, 'historical_rules': 0}
-    比报成「2 个键」有用得多 —— 后者看不出机器到底能不能用这些规则。
-    再往下就不钻了，收益递减而噪音翻倍。
-    """
-    if isinstance(value, list):
-        return len(value)
-
-    if isinstance(value, dict):
-        return {
-            key: (len(item) if isinstance(item, (list, dict)) else item)
-            for key, item in value.items()
-        }
-
-    return value
 
 
 # ============================================================
@@ -1100,7 +1157,9 @@ def build_graph(trace: list | None = None):
     返回值的映射 {分支名: 节点名} 不能省 ——
     不写的话 LangGraph 会拿分支名当节点名去找，名字对不上就报错。
 
-    trace 传一个列表进来就会记录每个节点的进出，不传就没有额外开销。
+    trace 传一个列表进来，每个节点的进出会**另存一份到内存**里给调用方 ——
+    **不传也照样记**，文件那一份和这个参数无关（见 traced 的说明）。
+
     日志**不放进 State**：它是诊断信息不是业务结果，塞进 State 会让
     checkpoint 跟着膨胀，而且没有哪个 Router 会去读它。
     """
@@ -1206,8 +1265,151 @@ def run(file_path: str, decisions: list | None = None, trace: list | None = None
     不传就是「没人表态」—— 那 LLM 提的候选会全部保持 pending，不会被应用。
 
     trace 传一个列表进来，每个节点跑完会往里面追一条进出记录。
+    这是给调用方的**内存副本**（跑完就没了）；同样的内容会由 logger
+    无条件写进 logs/trace.jsonl —— 不传这个参数不代表不记，
+    见 traced 的「为什么落盘和 sink 不是同一个开关」。
+
+    ---- V2：这里是「一次运行」和「一个 task_id」的分界 ----
+
+    run() 是任务的边界，所以 task_id 在这里发、在这里绑：
+
+        new_task_id()          这次运行独有的 ID
+        task_scope(task_id)    绑到当前执行流上，块里所有节点日志自动带上它
+        task_started / 收尾     任务级的两笔
+
+    为什么不在 logger 里自己生成：那样每个节点各生成一个，
+    九条 node_started 会有九个不同的 task_id，日志就废了。
+    一次运行一个 —— 只有知道「运行边界在哪」的这一层能发这个 ID，
+    而全项目知道边界的只有这里。
+
+    为什么不用全局变量存它：全局的在并发跑两次时会串。
+    contextvars 是跟着执行流走的，两次运行各绑各的。
+    （当前是同步单线程，用不上；但改起来就是这里的一行，
+     而全局变量要改的是所有读到它的地方。）
     """
-    return build_graph(trace).invoke(initial_state(file_path, decisions))
+    # 文件该滚就先滚。放在这里、而不是写到一半再滚，是因为
+    # **一次运行的行必须留在同一个文件里** —— 一跑完就发现后半截
+    # 在另一个文件里，对「结合着看」这件事是致命的（见 logger.rotate_if_needed）。
+    #
+    # 它自己不会抛异常，也不会因为要滚日志把这次运行拦下。
+    logger.rotate_if_needed()
+
+    task_id = logger.new_task_id()
+
+    # 起止时间在这里取，和 task_id 同一个地方 —— 因为「一次运行的边界」
+    # 只有这个函数知道。
+    started_at = datetime.datetime.now()
+
+    with logger.task_scope(task_id):
+        logger.task_started(task_id)
+
+        try:
+            final = build_graph(trace).invoke(initial_state(file_path, decisions))
+
+        except Exception as exc:
+            # 记一笔，然后**照原样抛出去** —— 这一段的全部意义就是
+            # 「日志里有记录」，不是「异常到此为止」。
+            #
+            # 这里没有 return 任何东西，所以调用方拿到的异常、
+            # traceback、退出码，和接入 Logger 之前一模一样。
+            #
+            # 兜的是 Exception 不是 BaseException：后者还包括
+            # KeyboardInterrupt（人把它掐了）和 SystemExit（程序主动退出），
+            # 那是两回事，不该记成「任务失败」。
+            logger.task_failed(task_id, message="流程抛出未捕获异常", error=exc)
+            # summary 先写、异常后抛：反过来的话（先 raise）这行就永远不会执行。
+            # 它自己不会抛异常（见 run_summary.write），所以不会顶掉上面那个 exc。
+            run_summary.write(
+                task_id,
+                started_at,
+                datetime.datetime.now(),
+                status=logger.FAILED,
+                error=exc,
+                # 抛异常这一路没有最终 State，人工复核根本没跑到 ——
+                # 所以 review 是 None，而 fail_category 只能靠「哪个节点炸的」判。
+                fail_category=run_summary.classify(failed_node=logger.last_failed_node()),
+            )
+            raise
+
+        # 走到这里说明流程**正常返回**了。但「正常返回」不等于「算成了」：
+        # halt_reason 有值 = 设计上就该停的那些情况（文件读不了、
+        # 人工否决了字段），流程在 exception 节点收住，State 照常返回。
+        #
+        # 所以事件记 task_completed（确实结束了），状态记 failed（没算成）。
+        # 和真正抛异常的那种失败靠 event 区分 ——
+        # 前者要找业务方确认口径，后者要看 traceback，处理的人都不一样。
+        review = _run_review(final)
+
+        if final.get("halt_reason"):
+            # fail_category 在**这里**判，因为只有 run() 同时看得见
+            # parse_error（输入行不行）和 halt_reason（业务上该不该停）。
+            # 节点各自只知道自己那一段，判不出这个整体结论。
+            category = run_summary.classify(
+                parse_error=final.get("parse_error"),
+                halt_reason=final.get("halt_reason"),
+            )
+            logger.task_completed(
+                task_id,
+                message="流程在 exception 节点停下（业务失败）",
+                status=logger.FAILED,
+            )
+            run_summary.write(
+                task_id,
+                started_at,
+                datetime.datetime.now(),
+                status=logger.FAILED,
+                fail_category=category,
+                review=review,
+            )
+        else:
+            logger.task_completed(task_id)
+            run_summary.write(
+                task_id,
+                started_at,
+                datetime.datetime.now(),
+                status=logger.SUCCESS,
+                # 成功就不填分类。填了会被读成「成功了，但属于 input_error」。
+                fail_category=None,
+                review=review,
+            )
+
+        return final
+
+
+def _run_review(final: dict) -> dict | None:
+    """从最终 State 里把人工复核的结果摘出来，收成 summary 的一格。
+
+    单独一个函数，是因为 run() 已经够长了，而且这一步不依赖
+    run() 的任何局部变量 —— 给它一个 State，它给一个字典。
+
+    ---- None 和「0 个候选」是两件事 ----
+
+    human_review 这个键**一开始就有**（initial_state 里预置的），
+    所以不能拿「键在不在」判断走没走到复核 —— 它永远在。
+
+    这里看的是 "approved" 这个子键在不在：
+        只有 human_review_node 会写它（见那个节点返回值里的 V2 注释）。
+        initial_state 里没有，所以「文件没打开、流程早停了」的时候它也不在。
+
+    于是：
+        review is None                       这次压根没走到复核
+        review["candidates"] == 0            复核了，一个候选都没有（表全认识）
+
+    这两种在报告里要分开说：
+        前者是「流程没跑起来」，后者是「跑得挺顺」。
+        混成一种，Evaluation 会把「表都打不开」和「没什么要问的」算作同类。
+    """
+    review = final.get("human_review") or {}
+
+    if "approved" not in review:
+        return None
+
+    return run_summary.review_record(
+        approved=review.get("approved"),
+        rejected=review.get("rejected"),
+        undecided=review.get("undecided"),
+        reviewer=review.get("reviewer"),
+    )
 
 
 if __name__ == "__main__":
@@ -1227,6 +1429,10 @@ if __name__ == "__main__":
 
         # trace 记的是每个节点的进出，看它就知道流程走了哪条路、
         # 每个节点当时手上有什么 —— 不用重跑加 print 去猜。
+        #
+        # 这里传一个列表进去，只是为了让下面能**当场**打出来。
+        # 同一份内容 logger 已经无条件写进 logs/trace.jsonl 了 ——
+        # 不传这个列表，文件照样有。
         trace = []
         final = run(file_path, decisions, trace=trace)
 
